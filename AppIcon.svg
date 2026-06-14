@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#4c1d95"/>
+    </linearGradient>
+    <linearGradient id="board" x1="0" y1="200" x2="0" y2="880" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e8e0f0"/>
+    </linearGradient>
+    <linearGradient id="clip-grad" x1="0" y1="140" x2="0" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#c4b5fd"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景填充（正方形，系统负责圆角遮罩） -->
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- 剪切板主体 -->
+  <rect x="272" y="220" width="480" height="620" rx="36" fill="url(#board)"/>
+
+  <!-- 顶部金属夹子 -->
+  <rect x="392" y="168" width="240" height="104" rx="52" fill="url(#clip-grad)"/>
+  <rect x="432" y="192" width="160" height="56" rx="28" fill="url(#bg)"/>
+
+  <!-- 内容行 — 模拟剪切板中的文本条目 -->
+  <!-- 第一条 -->
+  <rect x="328" y="340" width="300" height="22" rx="11" fill="#c4b5fd"/>
+  <rect x="328" y="376" width="368" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
+
+  <!-- 分隔线 -->
+  <rect x="328" y="424" width="368" height="2" rx="1" fill="#e9e3f5"/>
+
+  <!-- 第二条 -->
+  <rect x="328" y="452" width="260" height="22" rx="11" fill="#c4b5fd"/>
+  <rect x="328" y="488" width="340" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
+
+  <!-- 分隔线 -->
+  <rect x="328" y="536" width="368" height="2" rx="1" fill="#e9e3f5"/>
+
+  <!-- 第三条 -->
+  <rect x="328" y="564" width="320" height="22" rx="11" fill="#c4b5fd"/>
+  <rect x="328" y="600" width="280" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
+
+  <!-- 右下角叠层卡片 — 表示"粘贴/复制"概念 -->
+  <rect x="560" y="660" width="140" height="110" rx="16" fill="#a78bfa" opacity="0.6"/>
+  <rect x="580" y="644" width="140" height="110" rx="16" fill="#ffffff"/>
+  <!-- 卡片上的小勾 — 表示复制成功 -->
+  <polyline points="608,694 628,714 660,678" fill="none" stroke="#7c3aed" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
