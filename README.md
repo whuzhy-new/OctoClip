@@ -2,6 +2,25 @@
 
 > 轻量、优雅的 macOS 剪切板管理工具 — 双击 Shift 唤出，用完即走。
 
+## 安装
+
+### 方式一：下载 App（推荐）
+
+从 [Releases](https://github.com/whuzhy-new/OctoClip/releases) 下载 `OctoClip.zip`，解压后拖入 `应用程序` 文件夹即可。
+
+首次打开时若提示「无法验证开发者」，请在 **系统设置 → 隐私与安全性** 中点击「仍要打开」。
+
+### 方式二：从源码构建
+
+```bash
+git clone https://github.com/whuzhy-new/OctoClip.git
+cd OctoClip
+bash build.sh
+open dist/OctoClip.app
+```
+
+要求 macOS 12+，Xcode Command Line Tools。
+
 ## 特性
 
 - **双击 Shift 唤出** — 浮动面板居中弹出，带缩放淡入动画
@@ -13,16 +32,6 @@
 - **筛选 & 搜索** — 按时间、类型交叉筛选，支持关键词搜索
 - **自动清理** — 可配置保留时间（1/3/7/30 天）和最大条目数
 - **原生 SwiftUI** — 纯 Swift 编写，无第三方依赖
-
-## 构建
-
-```bash
-cd ClipboardApp
-bash build.sh
-open build/OctoClip.app
-```
-
-要求 macOS 12+，Xcode Command Line Tools。
 
 ## 使用
 

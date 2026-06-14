@@ -2,7 +2,7 @@
 set -e
 
 APP_NAME="OctoClip"
-BUILD_DIR="$(cd "$(dirname "$0")" && pwd)/build"
+BUILD_DIR="$(cd "$(dirname "$0")" && pwd)/dist"
 SOURCES_DIR="$(cd "$(dirname "$0")" && pwd)/Sources"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 
