@@ -1,8 +1,11 @@
 import AppKit
+import Combine
 import SwiftUI
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var expirationTimer: Timer?
+    private var statusObservation: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -15,100 +18,117 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 启动剪切板监听
         ClipboardMonitor.shared.start()
+        let store = ClipboardStore.shared
+        let timer = Timer(timeInterval: 60, repeats: true) { _ in
+            store.expireHistory()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        expirationTimer = timer
 
         // 注册 Shift 热键
         HotkeyManager.shared.onHotkey = {
             DispatchQueue.main.async {
-                ClipboardStore.shared.showingFavorites = false
                 PopupWindowController.shared.toggle()
             }
         }
         HotkeyManager.shared.onQuadShift = {
             DispatchQueue.main.async {
-                ClipboardStore.shared.showingFavorites = true
-                PopupWindowController.shared.show()
+                PopupWindowController.shared.show(favorites: true)
             }
         }
         HotkeyManager.shared.register()
+        statusObservation = ClipboardMonitor.shared.$pausedUntil.combineLatest(HotkeyManager.shared.$shortcut)
+            .sink { [weak self] pausedUntil, shortcut in
+                self?.updateStatus(paused: pausedUntil != nil, shortcut: shortcut?.label ?? "连按两次 Shift")
+            }
+        FavoriteSync.shared.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         ClipboardMonitor.shared.stop()
+        expirationTimer?.invalidate()
         HotkeyManager.shared.unregister()
+        FavoriteSync.shared.finish()
+        ClipboardStore.shared.finishSaving()
     }
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
-        if let button = statusItem.button {
-            button.image = makeMenuBarIcon()
-            button.image?.isTemplate = true
-            button.toolTip = "OctoClip — Double Shift 打开"
-        }
-
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "打开剪切板", action: #selector(openPopup), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
+        menu.delegate = self
         statusItem.menu = menu
     }
+
+    private func updateStatus(paused: Bool, shortcut: String) {
+        guard let button = statusItem.button else { return }
+        let label = paused ? "OctoClip · 记录已暂停" : "OctoClip"
+        let icon: LucideIcon = paused ? .circlePause : .clipboard
+        button.image = icon.menuBarImage(label: label)
+        button.toolTip = "\(label) · \(shortcut)"
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menu.addItem(NSMenuItem(title: "打开剪切板", action: #selector(openPopup), keyEquivalent: ""))
+        let queue = PasteQueue.shared
+        if !queue.items.isEmpty {
+            if queue.manualPayload != nil {
+                menu.addItem(NSMenuItem(title: "已粘贴，继续队列", action: #selector(confirmManualPaste), keyEquivalent: ""))
+            } else {
+                menu.addItem(NSMenuItem(title: "粘贴队列下一条（剩余 \(queue.items.count) 条）",
+                                        action: #selector(pasteNext), keyEquivalent: ""))
+            }
+            menu.addItem(NSMenuItem(title: "清空粘贴队列", action: #selector(clearQueue), keyEquivalent: ""))
+        }
+        menu.addItem(NSMenuItem.separator())
+        if let deadline = ClipboardMonitor.shared.pausedUntil {
+            let title = deadline == .distantFuture ? "恢复记录" :
+                "恢复记录（暂停至 \(DateFormatter.localizedString(from: deadline, dateStyle: .none, timeStyle: .short))）"
+            menu.addItem(NSMenuItem(title: title, action: #selector(resumeCapture), keyEquivalent: ""))
+        } else {
+            let item = NSMenuItem(title: "暂停记录", action: nil, keyEquivalent: "")
+            let choices = NSMenu()
+            for (title, minutes) in [("15 分钟", 15), ("1 小时", 60), ("直到手动恢复", 0)] {
+                let duration = NSMenuItem(title: title, action: #selector(pauseCapture(_:)), keyEquivalent: "")
+                duration.tag = minutes
+                duration.target = self
+                choices.addItem(duration)
+            }
+            item.submenu = choices
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
+        for item in menu.items where item.action != nil { item.target = self }
+    }
+
+    @objc private func pauseCapture(_ sender: NSMenuItem) {
+        ClipboardMonitor.shared.pause(minutes: sender.tag == 0 ? nil : sender.tag)
+    }
+
+    @objc private func resumeCapture() { ClipboardMonitor.shared.resume() }
+
+    @objc private func pasteNext() {
+        let window = PopupWindowController.shared
+        window.show()
+        DispatchQueue.main.async { _ = window.handleKeyCommand?(.pasteNext) }
+    }
+
+    @objc private func confirmManualPaste() { PasteQueue.shared.confirmManualPaste() }
+
+    @objc private func clearQueue() { PasteQueue.shared.clear() }
 
     @objc private func openPopup() {
         PopupWindowController.shared.show()
     }
 
-    @objc private func quitApp() {
-        NSApp.terminate(nil)
+    @objc private func openSettings() {
+        PopupWindowController.shared.show(destination: .settings)
     }
 
-    /// 用代码绘制菜单栏剪切板图标（与 AppIcon.svg 风格一致）
-    private func makeMenuBarIcon() -> NSImage {
-        let size = NSSize(width: 18, height: 18)
-        let image = NSImage(size: size, flipped: false) { rect in
-            guard NSGraphicsContext.current != nil else { return false }
-
-            let scale: CGFloat = 18.0 / 1024.0
-
-            // 剪切板主体
-            let boardRect = CGRect(x: 272 * scale, y: (1024 - 840) * scale,
-                                   width: 480 * scale, height: 620 * scale)
-            let boardPath = NSBezierPath(roundedRect: boardRect, xRadius: 36 * scale, yRadius: 36 * scale)
-            NSColor.black.setFill()
-            boardPath.fill()
-
-            // 顶部夹子
-            let clipRect = CGRect(x: 392 * scale, y: (1024 - 272) * scale,
-                                  width: 240 * scale, height: 104 * scale)
-            let clipPath = NSBezierPath(roundedRect: clipRect, xRadius: 52 * scale, yRadius: 52 * scale)
-            clipPath.fill()
-
-            // 夹子内凹
-            let holeRect = CGRect(x: 432 * scale, y: (1024 - 248) * scale,
-                                  width: 160 * scale, height: 56 * scale)
-            let holePath = NSBezierPath(roundedRect: holeRect, xRadius: 28 * scale, yRadius: 28 * scale)
-            NSColor.white.setFill()
-            holePath.fill()
-
-            // 内容线条
-            NSColor.white.setFill()
-            let lines: [(CGFloat, CGFloat, CGFloat)] = [
-                (328, 340, 300),
-                (328, 380, 368),
-                (328, 460, 260),
-                (328, 500, 340),
-                (328, 570, 320),
-                (328, 610, 280),
-            ]
-            for (x, y, w) in lines {
-                let lineRect = CGRect(x: x * scale, y: (1024 - y - 22) * scale,
-                                      width: w * scale, height: 22 * scale)
-                let linePath = NSBezierPath(roundedRect: lineRect, xRadius: 11 * scale, yRadius: 11 * scale)
-                linePath.fill()
-            }
-
-            return true
-        }
-        image.isTemplate = true
-        return image
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 }

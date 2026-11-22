@@ -53,4 +53,7 @@ enum MaxItemsOption: Int, CaseIterable {
 enum SettingsKey {
     static let retentionDays = "settings_retentionDays"
     static let maxItems = "settings_maxItems"
+    static let excludedApps = "settings_excludedApps"
+    static let capturePausedUntil = "settings_capturePausedUntil"
+    static let launchShortcut = "settings_launchShortcut"
 }

@@ -1,149 +1,102 @@
 import AppKit
-import Combine
 
-class ClipboardMonitor {
+class ClipboardMonitor: ObservableObject {
     static let shared = ClipboardMonitor()
 
+    @Published private(set) var pausedUntil = UserDefaults.standard.object(forKey: SettingsKey.capturePausedUntil) as? Date
+    @Published private(set) var excludedApps = ClipboardPasteboard.excludedApps(in: .standard)
     private var changeCount: Int = NSPasteboard.general.changeCount
     private var timer: Timer?
-    private var cancellables = Set<AnyCancellable>()
-
-    // 图片格式 UTI 常量
-    private static let gifType = NSPasteboard.PasteboardType("com.compuserve.gif")
-    private static let jpegType = NSPasteboard.PasteboardType("public.jpeg")
-    private static let heicType = NSPasteboard.PasteboardType("public.heic")
-    private static let webpType = NSPasteboard.PasteboardType("org.webmproject.webp")
+    private var activationObserver: NSObjectProtocol?
+    private var foregroundAppIDs: Set<String> = []
 
     private init() {}
 
     func start() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        guard timer == nil else { return }
+        if pausedUntil.map({ $0 <= Date() }) == true { resume() }
+        let workspace = NSWorkspace.shared
+        if let id = workspace.frontmostApplication?.bundleIdentifier { foregroundAppIDs.insert(id) }
+        activationObserver = workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+               let id = app.bundleIdentifier {
+                self?.foregroundAppIDs.insert(id)
+            }
+        }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.checkPasteboard()
         }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
+        foregroundAppIDs.removeAll()
+    }
+
+    func pause(minutes: Int?) {
+        updatePause(minutes.map { Date().addingTimeInterval(Double($0) * 60) } ?? .distantFuture)
+    }
+
+    func resume() { updatePause(nil) }
+
+    func ignoreCurrentChange() {
+        changeCount = NSPasteboard.general.changeCount
+    }
+
+    func excludeApplication(at url: URL) -> Bool {
+        guard let bundle = Bundle(url: url), let id = bundle.bundleIdentifier else { return false }
+        if excludedApps.contains(where: { $0.bundleID == id }) { return true }
+        let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+            ?? url.deletingPathExtension().lastPathComponent
+        replaceExclusions(excludedApps + [ClipSource(bundleID: id, name: name)])
+        return true
+    }
+
+    func includeApplication(_ bundleID: String) {
+        replaceExclusions(excludedApps.filter { $0.bundleID != bundleID })
+    }
+
+    private func updatePause(_ deadline: Date?) {
+        ignoreCurrentChange()
+        pausedUntil = deadline
+        UserDefaults.standard.set(deadline, forKey: SettingsKey.capturePausedUntil)
+    }
+
+    private func replaceExclusions(_ apps: [ClipSource]) {
+        excludedApps = apps.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        UserDefaults.standard.set(try? JSONEncoder().encode(excludedApps), forKey: SettingsKey.excludedApps)
     }
 
     private func checkPasteboard() {
         let pb = NSPasteboard.general
-        guard pb.changeCount != changeCount else { return }
-        changeCount = pb.changeCount
-
-        guard let types = pb.types else { return }
-
-        if types.contains(.fileURL) {
-            handleFile(pb)
-        } else if types.contains(Self.gifType) {
-            handleGIF(pb)
-        } else if types.contains(.tiff) || types.contains(.png) ||
-                  types.contains(Self.jpegType) || types.contains(Self.heicType) ||
-                  types.contains(Self.webpType) {
-            handleImage(pb, types: types)
-        } else if types.contains(.string) || types.contains(.rtf) || types.contains(.html) {
-            handleText(pb)
+        let app = NSWorkspace.shared.frontmostApplication
+        let currentAppIDs = Set([app?.bundleIdentifier].compactMap { $0 })
+        let candidateAppIDs = foregroundAppIDs.union(currentAppIDs)
+        foregroundAppIDs = currentAppIDs
+        if let pausedUntil {
+            if pausedUntil <= Date() { resume() }
+            else { ignoreCurrentChange() }
+            return
         }
-    }
-
-    private func handleText(_ pb: NSPasteboard) {
-        let plainText = pb.string(forType: .string)
-        let rtfData = pb.data(forType: .rtf)
-        let htmlData = pb.data(forType: .html)
-
-        guard plainText != nil || rtfData != nil || htmlData != nil else { return }
-
-        let item = ClipboardItem(
-            id: UUID(),
-            type: .text,
-            timestamp: Date(),
-            plainText: plainText,
-            rtfData: rtfData,
-            htmlData: htmlData,
-            imageData: nil,
-            imageFormat: nil,
-            fileURLs: nil
-        )
-        DispatchQueue.main.async {
-            ClipboardStore.shared.add(item)
-        }
-    }
-
-    private func handleGIF(_ pb: NSPasteboard) {
-        guard let gifData = pb.data(forType: Self.gifType) else { return }
-
-        let item = ClipboardItem(
-            id: UUID(),
-            type: .image,
-            timestamp: Date(),
-            plainText: nil,
-            rtfData: nil,
-            htmlData: nil,
-            imageData: gifData,
-            imageFormat: .gif,
-            fileURLs: nil
-        )
-        DispatchQueue.main.async {
-            ClipboardStore.shared.add(item)
-        }
-    }
-
-    private func handleImage(_ pb: NSPasteboard, types: [NSPasteboard.PasteboardType]) {
-        let extracted: (data: Data, format: ImageFormat)? = {
-            if types.contains(.png), let data = pb.data(forType: .png) {
-                return (data, .png)
-            }
-            if types.contains(Self.jpegType), let data = pb.data(forType: Self.jpegType) {
-                return (data, .jpeg)
-            }
-            if types.contains(Self.heicType), let data = pb.data(forType: Self.heicType) {
-                return (data, .heic)
-            }
-            if types.contains(Self.webpType), let data = pb.data(forType: Self.webpType) {
-                return (data, .webp)
-            }
-            // fallback: 通过 NSImage 转 PNG
-            guard let image = NSImage(pasteboard: pb),
-                  let tiffData = image.tiffRepresentation,
-                  let bitmap = NSBitmapImageRep(data: tiffData),
-                  let pngData = bitmap.representation(using: .png, properties: [:]) else { return nil }
-            return (pngData, .png)
-        }()
-
-        guard let (data, format) = extracted else { return }
-
-        let item = ClipboardItem(
-            id: UUID(),
-            type: .image,
-            timestamp: Date(),
-            plainText: nil,
-            rtfData: nil,
-            htmlData: nil,
-            imageData: data,
-            imageFormat: format,
-            fileURLs: nil
-        )
-        DispatchQueue.main.async {
-            ClipboardStore.shared.add(item)
-        }
-    }
-
-    private func handleFile(_ pb: NSPasteboard) {
-        guard let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return }
-
-        let item = ClipboardItem(
-            id: UUID(),
-            type: .file,
-            timestamp: Date(),
-            plainText: nil,
-            rtfData: nil,
-            htmlData: nil,
-            imageData: nil,
-            imageFormat: nil,
-            fileURLs: urls
-        )
-        DispatchQueue.main.async {
+        let snapshot = pb.changeCount
+        guard snapshot != changeCount else { return }
+        changeCount = snapshot
+        let item = ClipboardPasteboard.readItem(from: pb, excludedApps: excludedApps,
+                                                ownBundleID: Bundle.main.bundleIdentifier, activeApp: app,
+                                                candidateAppIDs: candidateAppIDs)
+        if pb.changeCount != snapshot {
+            foregroundAppIDs.formUnion(candidateAppIDs)
+        } else if let item {
             ClipboardStore.shared.add(item)
         }
     }

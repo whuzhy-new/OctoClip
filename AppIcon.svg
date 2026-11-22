@@ -1,51 +1,40 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#7c3aed"/>
-      <stop offset="100%" stop-color="#4c1d95"/>
+    <linearGradient id="tile" x1="116" y1="100" x2="885" y2="952" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c9ddff"/>
+      <stop offset=".45" stop-color="#7088ec"/>
+      <stop offset="1" stop-color="#273a89"/>
     </linearGradient>
-    <linearGradient id="board" x1="0" y1="200" x2="0" y2="880" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#e8e0f0"/>
+    <radialGradient id="light" cx="258" cy="141" r="675" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f3f9ff" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#e5edff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="108" y1="94" x2="884" y2="944" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".85"/>
+      <stop offset=".54" stop-color="#edf3ff" stop-opacity=".36"/>
+      <stop offset="1" stop-color="#bfcfff" stop-opacity=".68"/>
     </linearGradient>
-    <linearGradient id="clip-grad" x1="0" y1="140" x2="0" y2="240" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#c4b5fd"/>
-      <stop offset="100%" stop-color="#a78bfa"/>
+    <linearGradient id="paper" x1="311" y1="226" x2="752" y2="815" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".96"/>
+      <stop offset=".7" stop-color="#e7efff" stop-opacity=".86"/>
+      <stop offset="1" stop-color="#afc2fd" stop-opacity=".96"/>
+    </linearGradient>
+    <linearGradient id="clip" x1="408" y1="205" x2="618" y2="328" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff"/>
+      <stop offset="1" stop-color="#a9bffc"/>
     </linearGradient>
   </defs>
-
-  <!-- 背景填充（正方形，系统负责圆角遮罩） -->
-  <rect width="1024" height="1024" fill="url(#bg)"/>
-
-  <!-- 剪切板主体 -->
-  <rect x="272" y="220" width="480" height="620" rx="36" fill="url(#board)"/>
-
-  <!-- 顶部金属夹子 -->
-  <rect x="392" y="168" width="240" height="104" rx="52" fill="url(#clip-grad)"/>
-  <rect x="432" y="192" width="160" height="56" rx="28" fill="url(#bg)"/>
-
-  <!-- 内容行 — 模拟剪切板中的文本条目 -->
-  <!-- 第一条 -->
-  <rect x="328" y="340" width="300" height="22" rx="11" fill="#c4b5fd"/>
-  <rect x="328" y="376" width="368" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
-
-  <!-- 分隔线 -->
-  <rect x="328" y="424" width="368" height="2" rx="1" fill="#e9e3f5"/>
-
-  <!-- 第二条 -->
-  <rect x="328" y="452" width="260" height="22" rx="11" fill="#c4b5fd"/>
-  <rect x="328" y="488" width="340" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
-
-  <!-- 分隔线 -->
-  <rect x="328" y="536" width="368" height="2" rx="1" fill="#e9e3f5"/>
-
-  <!-- 第三条 -->
-  <rect x="328" y="564" width="320" height="22" rx="11" fill="#c4b5fd"/>
-  <rect x="328" y="600" width="280" height="22" rx="11" fill="#ddd6fe" opacity="0.7"/>
-
-  <!-- 右下角叠层卡片 — 表示"粘贴/复制"概念 -->
-  <rect x="560" y="660" width="140" height="110" rx="16" fill="#a78bfa" opacity="0.6"/>
-  <rect x="580" y="644" width="140" height="110" rx="16" fill="#ffffff"/>
-  <!-- 卡片上的小勾 — 表示复制成功 -->
-  <polyline points="608,694 628,714 660,678" fill="none" stroke="#7c3aed" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="87" y="111" width="850" height="850" rx="211" fill="#18294e" opacity=".22"/>
+  <rect x="86" y="88" width="852" height="852" rx="211" fill="url(#tile)"/>
+  <rect x="86" y="88" width="852" height="852" rx="211" fill="url(#light)"/>
+  <path d="M90 707c206-158 346-208 518-224 123-11 228 2 328 22v223c0 116-94 210-210 210H298c-112 0-201-85-208-193z" fill="#294691" opacity=".24"/>
+  <rect x="97" y="99" width="830" height="830" rx="200" fill="none" stroke="url(#edge)" stroke-width="9"/>
+  <rect x="287" y="286" width="484" height="540" rx="94" fill="#243879" opacity=".31"/>
+  <rect x="265" y="258" width="470" height="528" rx="86" fill="url(#paper)" stroke="url(#edge)" stroke-width="12"/>
+  <rect x="387" y="209" width="230" height="122" rx="48" fill="#4058a0" opacity=".46"/>
+  <rect x="387" y="190" width="230" height="120" rx="48" fill="url(#clip)" stroke="#f4f7ff" stroke-width="7"/>
+  <rect x="440" y="229" width="124" height="31" rx="15.5" fill="#4b62ae"/>
+  <path d="M357 430h274M357 522h222M357 614h152" fill="none" stroke="#3c55a0" stroke-width="35" stroke-linecap="round"/>
+  <rect x="561" y="589" width="198" height="184" rx="55" fill="#fff" fill-opacity=".8" stroke="#f5f8ff" stroke-width="8"/>
+  <path d="m610 677 34 34 67-75" fill="none" stroke="#405ab1" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

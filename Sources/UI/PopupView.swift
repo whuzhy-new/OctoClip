@@ -1,50 +1,24 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
-// MARK: - Design Tokens
-
-enum DS {
-    // 主色
-    static let accent = Color(nsColor: NSColor(red: 0.35, green: 0.34, blue: 0.84, alpha: 1.0)) // Indigo
-    static let accentLight = Color(nsColor: NSColor(red: 0.35, green: 0.34, blue: 0.84, alpha: 0.08))
-    static let accentMid = Color(nsColor: NSColor(red: 0.35, green: 0.34, blue: 0.84, alpha: 0.15))
-
-    // 类型色标
-    static let textColor = Color(nsColor: NSColor(red: 0.30, green: 0.36, blue: 0.80, alpha: 1.0))
-    static let textBg = Color(nsColor: NSColor(red: 0.30, green: 0.36, blue: 0.80, alpha: 0.07))
-    static let imageColor = Color(nsColor: NSColor(red: 0.16, green: 0.60, blue: 0.56, alpha: 1.0))
-    static let imageBg = Color(nsColor: NSColor(red: 0.16, green: 0.60, blue: 0.56, alpha: 0.07))
-    static let fileColor = Color(nsColor: NSColor(red: 0.80, green: 0.58, blue: 0.20, alpha: 1.0))
-    static let fileBg = Color(nsColor: NSColor(red: 0.80, green: 0.58, blue: 0.20, alpha: 0.07))
-
-    // 背景 & 表面
-    static let bg = Color(nsColor: .windowBackgroundColor)
-    static let surface = Color(nsColor: .controlBackgroundColor)
-    static let surfaceHover = Color(nsColor: NSColor(red: 0.35, green: 0.34, blue: 0.84, alpha: 0.05))
-
-    // 文字
-    static let textPrimary = Color(nsColor: .labelColor)
-    static let textSecondary = Color(nsColor: .secondaryLabelColor)
-    static let textTertiary = Color(nsColor: .tertiaryLabelColor)
-
-    // 其他
-    static let divider = Color(nsColor: .separatorColor).opacity(0.5)
-    static let favorite = Color(nsColor: NSColor(red: 0.95, green: 0.68, blue: 0.20, alpha: 1.0))
-
-    // 尺寸
-    static let cornerRadius: CGFloat = 12
-    static let cardRadius: CGFloat = 8
-}
-
-// MARK: - 筛选枚举
-
-enum TimeFilter: String, CaseIterable {
+private enum TimeFilter: String, CaseIterable {
     case all = "全部"
     case today = "今天"
     case yesterday = "昨天"
-    case threeDays = "近3天"
+    case threeDays = "近 3 天"
+
+    func contains(_ date: Date, calendar: Calendar, now: Date) -> Bool {
+        switch self {
+        case .all: return true
+        case .today: return calendar.isDateInToday(date)
+        case .yesterday: return calendar.isDateInYesterday(date)
+        case .threeDays:
+            return calendar.date(byAdding: .day, value: -3, to: now).map { date >= $0 } ?? false
+        }
+    }
 }
 
-enum TypeFilter: String, CaseIterable {
+private enum TypeFilter: String, CaseIterable {
     case all = "全部"
     case text = "文本"
     case image = "图片"
@@ -60,819 +34,1083 @@ enum TypeFilter: String, CaseIterable {
     }
 }
 
-enum ViewMode: String {
-    case list
-    case grid
+private enum ViewMode: String {
+    case list, grid
 }
 
-// MARK: - PopupView
-
 struct PopupView: View {
+    @Environment(\.colorSchemeContrast) private var contrast
     @ObservedObject var store = ClipboardStore.shared
+    @ObservedObject private var window = PopupWindowController.shared
+    @ObservedObject private var pasteService = PasteService.shared
+    @ObservedObject private var pasteQueue = PasteQueue.shared
+    @ObservedObject private var sync = FavoriteSync.shared
+    @StateObject private var imageText = ImageTextIndex()
+    @FocusState private var keyboardFocus: FocusTarget?
+    @AppStorage("viewMode") private var viewMode: ViewMode = .list
     @State private var searchText = ""
-    @State private var hoveredItemID: UUID? = nil
+    @State private var selectedItemID: UUID?
+    @State private var hoveredItemID: UUID?
+    @State private var cleanup: Cleanup?
     @State private var timeFilter: TimeFilter = .all
     @State private var typeFilter: TypeFilter = .all
-    @State private var showingSettings = false
-    @State private var viewMode: ViewMode = {
-        let saved = UserDefaults.standard.string(forKey: "viewMode") ?? "list"
-        return ViewMode(rawValue: saved) ?? .list
-    }()
+    @State private var showingTimeFilter = false
+    @State private var sourceFilter: String?
+    @State private var favoriteGroup: String?
+    @State private var editor: ClipEditorRequest?
+    @State private var pendingTemplatePaste: (clip: ClipboardItem, queued: PasteQueue.Entry?)?
+    @State private var batchMode = false
+    @State private var batchIDs: [UUID] = []
+    @State private var reviewingBatch = false
+    @State private var fileOperationInProgress = false
+    @State private var pendingImageCopy: (id: UUID, pasteboardChange: Int, presentation: Int)?
 
-    var filteredItems: [ClipboardItem] {
-        let source = store.showingFavorites ? store.favoriteItems : store.items
-        return source.filter { item in
-            let matchSearch = searchText.isEmpty ||
-                item.preview.localizedCaseInsensitiveContains(searchText)
-            let matchType = typeFilter == .all || item.type == typeFilter.itemType
-            let matchTime: Bool = {
-                switch timeFilter {
-                case .all: return true
-                case .today:
-                    return Calendar.current.isDateInToday(item.timestamp)
-                case .yesterday:
-                    return Calendar.current.isDateInYesterday(item.timestamp)
-                case .threeDays:
-                    let cutoff = Calendar.current.date(byAdding: .day, value: -3, to: Date()) ?? Date()
-                    return item.timestamp >= cutoff
-                }
-            }()
-            return matchSearch && matchType && matchTime
+    private struct Cleanup: Identifiable {
+        let id = UUID()
+        let title: String
+        let items: Set<UUID>
+    }
+
+    private enum FocusTarget: Hashable {
+        case search
+        case result(UUID)
+    }
+
+    private static let scopes = [
+        PanelSegment(choice: false, title: "历史", symbol: .clock),
+        PanelSegment(choice: true, title: "收藏", symbol: .star)
+    ]
+    private static let types = TypeFilter.allCases.map {
+        PanelSegment(choice: $0, title: $0.rawValue)
+    }
+    private static let layouts = [
+        PanelSegment(choice: ViewMode.list, title: "列表视图", symbol: .list),
+        PanelSegment(choice: ViewMode.grid, title: "宫格视图", symbol: .grid)
+    ]
+    private static let gridColumns = [GridItem(.adaptive(minimum: PanelStyle.gridMinimumWidth), spacing: PanelStyle.gap)]
+
+    private var sourceItems: [ClipboardItem] {
+        guard store.showingFavorites else { return store.items }
+        return allFavorites.filter { favoriteGroup == nil || $0.group == favoriteGroup }
+    }
+
+    private var allFavorites: [ClipboardItem] {
+        let localIDs = Set(store.favoriteItems.map(\.id))
+        return (store.favoriteItems + sync.incoming.filter { !localIDs.contains($0.id) })
+            .sorted { $0.timestamp > $1.timestamp }
+    }
+
+    private var groups: [String] {
+        Array(Set(allFavorites.compactMap(\.group))).sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
         }
+    }
+
+    private var sourceApps: [ClipSource] {
+        var seen: Set<String> = []
+        return sourceItems.compactMap(\.source).filter { seen.insert($0.bundleID).inserted }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private var activeSourceName: String? {
+        sourceFilter.map { id in sourceApps.first(where: { $0.bundleID == id })?.name ?? id }
+    }
+
+    private var filterLabel: String {
+        var parts = ["时间和来源筛选"]
+        if timeFilter != .all { parts.append(timeFilter.rawValue) }
+        if let activeSourceName { parts.append(activeSourceName) }
+        return parts.joined(separator: "，")
+    }
+
+    private var selectedClips: [ClipboardItem] {
+        guard !batchIDs.isEmpty else { return [] }
+        let entries = store.showingFavorites ? allFavorites : store.items
+        let byID = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return batchIDs.compactMap { byID[$0] }
+    }
+
+    private var isSearchingImages: Bool {
+        imageText.indexing && !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            sourceItems.contains { $0.supportsTextRecognition && imageText.results[$0.id] == nil && passesFilters($0) }
+    }
+
+    private func passesFilters(_ item: ClipboardItem, now: Date = Date()) -> Bool {
+        (typeFilter.itemType == nil || typeFilter.itemType == item.type) &&
+            (sourceFilter == nil || sourceFilter == item.source?.bundleID) &&
+            timeFilter.contains(item.timestamp, calendar: .current, now: now)
+    }
+
+    private var filteredItems: [ClipboardItem] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = Date()
+        return sourceItems.filter { item in
+            passesFilters(item, now: now) && (query.isEmpty || item.matchesSearch(query) ||
+                imageText.results[item.id]?.localizedCaseInsensitiveContains(query) == true)
+        }
+    }
+
+    private var displayedItems: [ClipboardItem] {
+        reviewingBatch ? selectedClips : filteredItems
     }
 
     var body: some View {
-        if showingSettings {
-            SettingsView(onDismiss: { showingSettings = false })
-                .frame(width: 620, height: 480)
-        } else {
-            VStack(spacing: 0) {
-                headerBar
-                searchBar
-                filterBar
-                if viewMode == .list {
-                    listContent
-                } else {
-                    gridContent
+        PanelShell {
+            if window.destination == .settings {
+                SettingsView(store: store, onDismiss: { window.destination = .clipboard })
+            } else {
+                let items = filteredItems
+                VStack(spacing: PanelStyle.gap) {
+                    header
+                    results(reviewingBatch ? selectedClips : items)
+                    notices
+                    footer(filtered: items)
                 }
-                footer
-            }
-            .background(DS.bg)
-            .clipShape(RoundedRectangle(cornerRadius: DS.cornerRadius))
-            .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 4)
-            .shadow(color: Color.black.opacity(0.04), radius: 2, x: 0, y: 1)
-        }
-    }
-
-    // MARK: - 顶部栏
-
-    private var headerBar: some View {
-        HStack(spacing: 0) {
-            // Tab 切换
-            HStack(spacing: 2) {
-                tabPill(title: "历史", icon: "clock.arrow.circlepath", active: !store.showingFavorites) {
-                    store.showingFavorites = false
-                }
-                tabPill(title: "收藏", icon: "star", active: store.showingFavorites) {
-                    store.showingFavorites = true
+                .disabled(pasteService.isPasting)
+                .alert(item: $cleanup) { request in
+                    Alert(
+                        title: Text(request.title),
+                        message: Text("将删除 \(request.items.count) 条历史记录，收藏会保留。"),
+                        primaryButton: .cancel(Text("取消")),
+                        secondaryButton: .destructive(Text("删除")) {
+                            store.deleteHistory(ids: request.items)
+                            focusSearch()
+                        }
+                    )
                 }
             }
-
-            Spacer()
-
-            // 设置
-            Button(action: { showingSettings = true }) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(DS.textTertiary)
-                    .frame(width: 26, height: 24)
-            }
-            .buttonStyle(.plain)
-            .help("设置")
-
-            // 视图切换
-            HStack(spacing: 1) {
-                viewToggle(icon: "list.bullet", mode: .list)
-                viewToggle(icon: "square.grid.2x2", mode: .grid)
-            }
-            .padding(2)
-            .background(DS.accentLight)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
+        .onAppear {
+            window.handleKeyCommand = handleKeyCommand
+            updateTextIndex()
+            focusSearch()
+        }
+        .onDisappear { window.handleKeyCommand = nil }
+        .onChange(of: window.presentation) { _ in focusSearch() }
+        .onChange(of: window.destination) { _ in
+            showingTimeFilter = false
+            focusSearch()
+        }
+        .onChange(of: store.showingFavorites) { _ in
+            clearBatch()
+            sourceFilter = nil
+            resetSelection()
+        }
+        .onChange(of: typeFilter) { _ in filtersDidChange() }
+        .onChange(of: timeFilter) { _ in filtersDidChange() }
+        .onChange(of: sourceFilter) { _ in filtersDidChange() }
+        .onChange(of: favoriteGroup) { _ in
+            if let sourceFilter, !sourceApps.contains(where: { $0.bundleID == sourceFilter }) {
+                self.sourceFilter = nil
+            }
+            filtersDidChange()
+        }
+        .onChange(of: keyboardFocus) { focus in
+            if case .result(let id)? = focus { selectedItemID = id }
+        }
+        .onChange(of: selectedClips.isEmpty) { empty in
+            if empty && reviewingBatch { closeSelectedReview() }
+        }
+        .onChange(of: groups) { names in
+            if let favoriteGroup, !names.contains(favoriteGroup) { self.favoriteGroup = nil }
+        }
+        .onChange(of: viewMode) { _ in hoveredItemID = nil }
+        .onReceive(store.$items) { _ in DispatchQueue.main.async { updateTextIndex() } }
+        .onReceive(store.$favoriteItems) { _ in DispatchQueue.main.async { updateTextIndex() } }
+        .onReceive(sync.$incoming) { _ in DispatchQueue.main.async { updateTextIndex() } }
+        .onReceive(imageText.$results) { results in
+            if let pending = pendingImageCopy, let text = results[pending.id] {
+                DispatchQueue.main.async { finishImageCopy(pending.id, text: text) }
+            }
+        }
+        .sheet(item: $editor, onDismiss: editorDidDismiss) { request in
+            ClipEditor(request: request, groups: groups) { edited in
+                commitEdit(edited, request: request)
+            } onCancel: {
+                editor = nil
+            }
+        }
     }
 
-    private func tabPill(title: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 11, weight: .medium))
-                Text(title)
-                    .font(.system(size: 12, weight: active ? .semibold : .regular))
-            }
-            .foregroundColor(active ? DS.accent : DS.textSecondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(active ? DS.accentLight : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+    private var header: some View {
+        VStack(spacing: PanelStyle.gap) {
+            searchField
+            toolbar
+                .padding(.horizontal, PanelStyle.segmentInset)
         }
-        .buttonStyle(.plain)
     }
 
-    private func viewToggle(icon: String, mode: ViewMode) -> some View {
-        Button {
-            viewMode = mode
-            UserDefaults.standard.set(mode.rawValue, forKey: "viewMode")
-        } label: {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(viewMode == mode ? DS.accent : DS.textTertiary)
-                .frame(width: 26, height: 24)
-                .background(viewMode == mode ? DS.accentMid : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 5))
-        }
-        .buttonStyle(.plain)
+    private var headerSeparator: some View {
+        Rectangle()
+            .fill(contrast == .increased ? PanelStyle.border : PanelStyle.separator)
+            .accessibilityHidden(true)
+            .allowsHitTesting(false)
     }
 
-    // MARK: - 搜索栏
-
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(DS.textTertiary)
-
-            TextField("搜索剪贴板内容…", text: $searchText)
+    private var searchField: some View {
+        let shape = RoundedRectangle(cornerRadius: PanelStyle.searchCorner, style: .continuous)
+        return HStack(spacing: PanelStyle.gap) {
+            LucideGlyph(.search)
+                .foregroundStyle(PanelStyle.muted)
+                .accessibilityHidden(true)
+            TextField("搜索剪贴板", text: $searchText,
+                      prompt: Text("搜索剪贴板…").foregroundColor(PanelStyle.muted))
                 .textFieldStyle(.plain)
-                .font(.system(size: 13))
-
+                .font(PanelStyle.searchFont)
+                .focused($keyboardFocus, equals: .search)
+                .onChange(of: searchText) { _ in filtersDidChange() }
+                .onSubmit {
+                    if let item = selectedItem(in: displayedItems) { activate(item) }
+                }
             if !searchText.isEmpty {
-                Button(action: { searchText = "" }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 13))
-                        .foregroundColor(DS.textTertiary)
+                Button {
+                    searchText = ""
+                    focusSearch()
+                } label: {
+                    LucideGlyph(.circleX)
+                        .foregroundStyle(PanelStyle.muted)
+                        .frame(width: PanelStyle.toolHeight, height: PanelStyle.toolHeight)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("清除搜索")
+                .help("清除搜索")
+            }
+            if store.showingFavorites && !groups.isEmpty {
+                favoriteGroupMenu
+                    .padding(.leading, PanelStyle.smallGap)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(DS.surface)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
-    }
-
-    // MARK: - 筛选栏
-
-    private var filterBar: some View {
-        HStack(spacing: 6) {
-            // 时间筛选
-            ForEach(TimeFilter.allCases, id: \.self) { t in
-                chipButton(title: t.rawValue, active: timeFilter == t) {
-                    timeFilter = t
-                }
-            }
-
-            Rectangle()
-                .fill(DS.divider)
-                .frame(width: 1, height: 16)
-                .padding(.horizontal, 4)
-
-            // 类型筛选
-            ForEach(TypeFilter.allCases, id: \.self) { t in
-                chipButton(title: t.rawValue, icon: typeIcon(t), active: typeFilter == t) {
-                    typeFilter = t
-                }
-            }
-
-            Spacer()
-
-            // 清理菜单
-            Menu {
-                Button(action: { store.clear() }) {
-                    Label("清空全部", systemImage: "trash")
-                }
-                Divider()
-                Button("删除 1 天前") { store.purgeOlderThan(days: 1) }
-                Button("删除 3 天前") { store.purgeOlderThan(days: 3) }
-                Button("删除 7 天前") { store.purgeOlderThan(days: 7) }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(DS.textTertiary)
-                    .frame(width: 28, height: 28)
-            }
-            .menuStyle(.borderlessButton)
-            .frame(width: 28)
-        }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 10)
-    }
-
-    private func chipButton(title: String, icon: String? = nil, active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 3) {
-                if let icon = icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 9, weight: .semibold))
-                }
-                Text(title)
-                    .font(.system(size: 11, weight: active ? .semibold : .regular))
-            }
-            .foregroundColor(active ? DS.accent : DS.textSecondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(active ? DS.accentLight : Color.clear)
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func typeIcon(_ t: TypeFilter) -> String? {
-        switch t {
-        case .all: return nil
-        case .text: return "doc.text"
-        case .image: return "photo"
-        case .file: return "folder"
-        }
-    }
-
-    // MARK: - 列表视图
-
-    private var listContent: some View {
-        Group {
-            if filteredItems.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(filteredItems, id: \.id) { item in
-                            Button {
-                                PasteService.shared.pasteToFrontApp(item, mode: .original)
-                            } label: {
-                                ItemRow(item: item, isHovered: hoveredItemID == item.id, isFavorite: store.isFavorite(item))
-                            }
-                            .buttonStyle(.plain)
-                            .onHover { h in hoveredItemID = h ? item.id : nil }
-                            .contextMenu { itemContextMenu(for: item) }
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                }
+        .padding(.leading, PanelStyle.itemInset)
+        .padding(.trailing, PanelStyle.smallGap)
+        .frame(height: PanelStyle.searchHeight)
+        .background(PanelStyle.searchSurface.opacity(PanelStyle.searchFillOpacity), in: shape)
+        .panelGlass(in: shape)
+        .clipShape(shape)
+        .overlay {
+            if contrast == .increased {
+                shape.strokeBorder(PanelStyle.border, lineWidth: PanelStyle.outlineWidth)
+                    .allowsHitTesting(false)
             }
         }
-        .frame(maxHeight: .infinity)
     }
-
-    // MARK: - 宫格视图
-
-    private static let gridColumns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
-
-    private var gridContent: some View {
-        Group {
-            if filteredItems.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: Self.gridColumns, spacing: 10) {
-                        ForEach(filteredItems, id: \.id) { item in
-                            Button {
-                                PasteService.shared.pasteToFrontApp(item, mode: .original)
-                            } label: {
-                                GridCell(item: item, isHovered: hoveredItemID == item.id, isFavorite: store.isFavorite(item))
-                                    .frame(height: 140)
-                            }
-                            .buttonStyle(.plain)
-                            .onHover { h in hoveredItemID = h ? item.id : nil }
-                            .contextMenu { itemContextMenu(for: item) }
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                }
-            }
-        }
-        .frame(maxHeight: .infinity)
-    }
-
-    // MARK: - 右键菜单
 
     @ViewBuilder
-    private func itemContextMenu(for item: ClipboardItem) -> some View {
-        Button("原样粘贴") {
-            PasteService.shared.pasteToFrontApp(item, mode: .original)
-        }
-        if item.type == .text {
-            Button("纯文本粘贴") {
-                PasteService.shared.pasteToFrontApp(item, mode: .plainText)
+    private var toolbar: some View {
+        if #available(macOS 13, *) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PanelStyle.gap) {
+                    browseControls.frame(maxWidth: .infinity, alignment: .leading)
+                    tools
+                }
+                stackedToolbar
             }
-        }
-        Divider()
-        Button(store.isFavorite(item) ? "取消收藏" : "收藏") {
-            store.toggleFavorite(item)
-        }
-        Divider()
-        Button("删除") {
-            store.remove(item)
+        } else {
+            stackedToolbar
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: store.showingFavorites ? "star.slash" : "clipboard")
-                .font(.system(size: 32, weight: .ultraLight))
-                .foregroundColor(DS.textTertiary.opacity(0.6))
-            Text(emptyText)
-                .font(.system(size: 12))
-                .foregroundColor(DS.textTertiary)
+    private var stackedToolbar: some View {
+        VStack(alignment: .leading, spacing: PanelStyle.gap) {
+            browseControls
+            tools
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var browseControls: some View {
+        HStack(spacing: PanelStyle.smallGap) {
+            PanelSegments(label: "浏览范围", options: Self.scopes, selection: $store.showingFavorites)
+            headerSeparator
+                .frame(width: PanelStyle.outlineWidth, height: PanelStyle.toolbarSeparatorHeight)
+            PanelSegments(label: "类型筛选", options: Self.types, selection: $typeFilter)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var tools: some View {
+        HStack(spacing: PanelStyle.segmentInset) {
+            PanelSegments(label: "显示方式", options: Self.layouts, selection: $viewMode, iconsOnly: true)
+            batchButton
+                .disabled(sourceItems.isEmpty && !batchMode)
+                .padding(.leading, PanelStyle.smallGap)
+            PanelIconButton(
+                symbol: .calendarDays,
+                label: filterLabel,
+                active: timeFilter != .all || sourceFilter != nil || showingTimeFilter,
+                visibleTitle: activeSourceName ?? (timeFilter == .all ? nil : timeFilter.rawValue),
+                grouped: true
+            ) {
+                showingTimeFilter.toggle()
+            }
+            .popover(isPresented: $showingTimeFilter, arrowEdge: .top) { timeFilterPopover }
+            .onChange(of: showingTimeFilter) { visible in
+                if !visible { focusSearch() }
+            }
+            if store.showingFavorites { favoriteActions }
+            else { cleanupMenu }
+            PanelIconButton(symbol: .settings, label: "设置", grouped: true) {
+                window.destination = .settings
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var batchButton: some View {
+        let title = batchMode ? "退出多选" : "多选"
+        return PanelIconButton(symbol: .circleCheck, label: title, active: batchMode,
+                               visibleTitle: title, grouped: true, action: toggleBatchMode)
+    }
+
+    private var timeFilterPopover: some View {
+        VStack(alignment: .leading, spacing: PanelStyle.sectionGap) {
+            VStack(alignment: .leading, spacing: PanelStyle.smallGap) {
+                Text("时间").font(PanelStyle.controlFont)
+                Picker("时间", selection: $timeFilter) {
+                    ForEach(TimeFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+            if !sourceApps.isEmpty || sourceFilter != nil {
+                Picker("来源应用", selection: $sourceFilter) {
+                    Text("所有应用").tag(String?.none)
+                    ForEach(sourceApps, id: \.bundleID) { app in
+                        Text(app.name).tag(Optional(app.bundleID))
+                    }
+                    if let sourceFilter, !sourceApps.contains(where: { $0.bundleID == sourceFilter }) {
+                        Text(sourceFilter).tag(Optional(sourceFilter))
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                PanelPrimaryButton(title: "完成") { showingTimeFilter = false }
+            }
+        }
+        .padding(PanelStyle.horizontalInset)
+        .fixedSize(horizontal: true, vertical: false)
+        .tint(PanelStyle.selection)
+    }
+
+    private var cleanupMenu: some View {
+        toolbarMenu(label: "历史操作") {
+            Button("清空历史") {
+                requestCleanup(title: "清空历史？", items: Set(store.items.map(\.id)))
+            }
+            .disabled(store.items.isEmpty)
+            Divider()
+            ForEach([1, 3, 7], id: \.self) { days in
+                let ids = store.expirationIDs(days: days)
+                Button("删除 \(days) 天前的历史") {
+                    requestCleanup(title: "删除 \(days) 天前的历史？", items: ids)
+                }
+                .disabled(ids.isEmpty)
+            }
+        }
+    }
+
+    private var favoriteGroupMenu: some View {
+        Menu {
+            Picker("收藏分组", selection: $favoriteGroup) {
+                Text("全部收藏").tag(String?.none)
+                ForEach(groups, id: \.self) { group in Text(group).tag(Optional(group)) }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Text(favoriteGroup ?? "全部收藏")
+                .font(PanelStyle.controlFont)
+                .lineLimit(1)
+                .frame(maxWidth: PanelStyle.searchScopeWidth, alignment: .trailing)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.trailing, PanelStyle.smallGap)
+        .accessibilityLabel("收藏分组，\(favoriteGroup ?? "全部收藏")")
+    }
+
+    private var favoriteActions: some View {
+        toolbarMenu(label: "收藏操作") {
+            Button("新建片段…") { editor = .create(group: favoriteGroup) }
+            Divider()
+            Button("导出本机收藏…") { exportFavorites() }
+                .disabled(store.favoriteItems.isEmpty || fileOperationInProgress)
+            Button("导入收藏…") { importFavorites() }
+                .disabled(fileOperationInProgress)
+        }
+    }
+
+    private func toolbarMenu<Content: View>(label: String,
+                                             @ViewBuilder content: () -> Content) -> some View {
+        Menu(content: content) {
+            Color.clear
+                .frame(width: PanelStyle.toolWidth, height: PanelStyle.segmentHeight)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .frame(width: PanelStyle.toolWidth, height: PanelStyle.segmentHeight)
+        // Draw the glyph in SwiftUI so it uses the panel's adaptive text color.
+        .overlay {
+            LucideGlyph(.ellipsis)
+                .foregroundStyle(PanelStyle.text)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .accessibilityLabel(label)
+        .help(label)
+    }
+
+    private func focusSearch() {
+        guard window.destination == .clipboard, editor == nil else { return }
+        keyboardFocus = nil
+        DispatchQueue.main.async {
+            if window.destination == .clipboard && !showingTimeFilter && editor == nil { keyboardFocus = .search }
+        }
+    }
+
+    private func selectedItem(in items: [ClipboardItem]) -> ClipboardItem? {
+        items.first { $0.id == selectedItemID } ?? items.first
+    }
+
+    private func handleKeyCommand(_ command: PopupWindowController.KeyCommand) -> Bool {
+        switch command {
+        case .escape:
+            if cleanup != nil {
+                cleanup = nil
+                focusSearch()
+            } else if showingTimeFilter {
+                showingTimeFilter = false
+            } else if window.destination == .settings {
+                window.destination = .clipboard
+            } else if reviewingBatch {
+                closeSelectedReview()
+            } else if batchMode {
+                clearBatch()
+                focusSearch()
+            } else {
+                return false
+            }
+        case .move(let offset):
+            guard window.destination == .clipboard, !showingTimeFilter, cleanup == nil,
+                  !pasteService.isPasting, keyboardFocus == .search, editor == nil else { return false }
+            let items = displayedItems
+            guard !items.isEmpty else { return false }
+            let current = items.firstIndex { $0.id == selectedItemID } ?? items.startIndex
+            let next = min(max(current + offset, 0), items.count - 1)
+            if next != current { pasteService.clearFeedback() }
+            selectedItemID = items[next].id
+        case .pasteNext:
+            guard window.destination == .clipboard, !showingTimeFilter, cleanup == nil,
+                  !pasteService.isPasting, editor == nil else { return false }
+            pasteNextInQueue()
+        case .preview, .spacePreview, .pasteIndex, .plainPaste:
+            guard window.destination == .clipboard, !showingTimeFilter, cleanup == nil,
+                  !pasteService.isPasting, editor == nil else { return false }
+            let items = displayedItems
+            switch command {
+            case .preview:
+                guard let item = selectedItem(in: items) else { return false }
+                preview(item)
+            case .spacePreview:
+                guard case .result(let id)? = keyboardFocus,
+                      let item = items.first(where: { $0.id == id }) else { return false }
+                preview(item)
+            case .pasteIndex(let index):
+                guard items.indices.contains(index), !batchMode else { return false }
+                activate(items[index])
+            case .plainPaste:
+                guard let item = selectedItem(in: items), item.type == .text, !batchMode else { return false }
+                paste(item, mode: .plainText)
+            default: return false
+            }
+        }
+        return true
+    }
+
+    private func activate(_ item: ClipboardItem) {
+        if batchMode || NSApp.currentEvent?.modifierFlags.contains(.command) == true &&
+            NSApp.currentEvent?.type == .leftMouseUp {
+            toggleBatchItem(item)
+        } else if !item.templateFields.isEmpty {
+            editor = .fill(item)
+        } else {
+            paste(item)
+        }
+    }
+
+    private func paste(_ item: ClipboardItem, mode: PasteMode = .original) {
+        selectedItemID = item.id
+        pasteService.pasteToFrontApp(item, mode: mode)
+    }
+
+    private func preview(_ item: ClipboardItem) {
+        selectedItemID = item.id
+        keyboardFocus = nil
+        do {
+            try window.showPreview(item, onClose: focusSearch)
+        } catch {
+            pasteService.report(item.type == .file ? "原文件已移动或无法访问。" : "无法打开快速查看。")
+            focusSearch()
+        }
+    }
+
+    private func commitEdit(_ clip: ClipboardItem, request: ClipEditorRequest) {
+        switch request {
+        case .fill(_, let queued):
+            pendingTemplatePaste = (clip, queued)
+        case .merge:
+            pendingTemplatePaste = (clip, nil)
+        case .metadata(_, let favorite):
+            if favorite { store.saveFavorite(clip) }
+            else { store.editMetadata(id: clip.id, name: clip.name, sourceURL: clip.sourceURL) }
+        case .create:
+            store.saveFavorite(clip)
+        }
+        editor = nil
+    }
+
+    private func editorDidDismiss() {
+        if let pending = pendingTemplatePaste {
+            pendingTemplatePaste = nil
+            DispatchQueue.main.async {
+                if let queued = pending.queued { pasteQueue.paste(queued, filled: pending.clip) }
+                else { paste(pending.clip, mode: .plainText) }
+            }
+        } else {
+            focusSearch()
+        }
+    }
+
+    private func updateTextIndex() {
+        imageText.update(store.items + store.favoriteItems + sync.incoming)
+    }
+
+    private func copyText(_ text: String, confirmation: String) {
+        let copied = pasteService.copyToClipboard(.text(text), mode: .plainText)
+        pasteService.report(copied ? confirmation : "无法写入剪贴板。")
+    }
+
+    private func copyImageText(_ item: ClipboardItem) {
+        guard let text = imageText.results[item.id] else {
+            pendingImageCopy = (item.id, NSPasteboard.general.changeCount, window.presentation)
+            imageText.prioritize(item)
+            pasteService.report("正在识别图中文字…")
+            return
+        }
+        pendingImageCopy = nil
+        copyRecognizedText(text)
+    }
+
+    private func finishImageCopy(_ id: UUID, text: String) {
+        guard let pending = pendingImageCopy, pending.id == id else { return }
+        pendingImageCopy = nil
+        guard window.isVisible, window.presentation == pending.presentation, window.destination == .clipboard else { return }
+        guard NSPasteboard.general.changeCount == pending.pasteboardChange else {
+            pasteService.report("已识别文字，可从条目菜单复制。")
+            return
+        }
+        copyRecognizedText(text)
+    }
+
+    private func copyRecognizedText(_ text: String) {
+        guard !text.isEmpty else {
+            pasteService.report("未识别到可复制的文字。")
+            return
+        }
+        copyText(text, confirmation: "已复制图中文字。")
+    }
+
+    private func toggleBatchMode() {
+        if batchMode { clearBatch() }
+        else { batchMode = true }
+        focusSearch()
+    }
+
+    private func clearBatch() {
+        batchMode = false
+        batchIDs = []
+        reviewingBatch = false
+    }
+
+    private func closeSelectedReview() {
+        reviewingBatch = false
+        resetSelection()
+        focusSearch()
+    }
+
+    private func toggleBatchItem(_ item: ClipboardItem) {
+        batchMode = true
+        if let index = batchIDs.firstIndex(of: item.id) {
+            batchIDs.remove(at: index)
+        } else {
+            batchIDs.append(item.id)
+            if item.supportsTextRecognition { imageText.prioritize(item) }
+        }
+        selectedItemID = item.id
+        focusSearch()
+    }
+
+    private func beginQueue(_ clips: [ClipboardItem]) {
+        pasteQueue.start(clips)
+        clearBatch()
+        pasteNextInQueue()
+    }
+
+    private func pasteNextInQueue() {
+        guard let entry = pasteQueue.nextEntry, editor == nil else { return }
+        if entry.item.templateFields.isEmpty {
+            pasteQueue.paste(entry)
+        } else {
+            editor = .fill(entry.item, queued: entry)
+        }
+    }
+
+    private func mergeAndPaste(_ clips: [ClipboardItem]) {
+        if clips.contains(where: { !$0.templateFields.isEmpty }) {
+            editor = .merge(clips)
+        } else {
+            paste(.text(ClipDocument.mergedText(clips)), mode: .plainText)
+        }
+    }
+
+    private func exportFavorites() {
+        let clips = store.favoriteItems
+        saveDocument(filename: "OctoClip 收藏.json", type: .json, confirmation: "收藏已导出。") {
+            try FavoriteArchive(clips).encode()
+        }
+    }
+
+    private func saveDocument(filename: String, type: UTType, confirmation: String, data: @escaping () throws -> Data) {
+        let dialog = NSSavePanel()
+        dialog.nameFieldStringValue = filename
+        dialog.allowedContentTypes = [type]
+        window.presentFilePanel(dialog) { url in
+            fileOperationInProgress = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let success: Bool
+                do {
+                    try data().write(to: url, options: .atomic)
+                    success = true
+                } catch {
+                    success = false
+                }
+                DispatchQueue.main.async {
+                    fileOperationInProgress = false
+                    pasteService.report(success ? confirmation : "无法写入文件，请检查目标位置后重试。")
+                }
+            }
+        }
+    }
+
+    private func importFavorites() {
+        let dialog = NSOpenPanel()
+        dialog.allowedContentTypes = [.json]
+        window.presentFilePanel(dialog) { url in
+            fileOperationInProgress = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let clips = try? FavoriteArchive.read(url)
+                DispatchQueue.main.async {
+                    fileOperationInProgress = false
+                    if let clips {
+                        let count = store.importFavorites(clips)
+                        pasteService.report(count == 0 ? "这些收藏已存在。" : "已导入 \(count) 条收藏。")
+                    } else {
+                        pasteService.report("无法读取文件，请选择 OctoClip 导出的收藏。")
+                    }
+                }
+            }
+        }
+    }
+
+    private func resetSelection() {
+        selectedItemID = nil
+        pasteService.clearFeedback()
+    }
+
+    private func filtersDidChange() {
+        reviewingBatch = false
+        resetSelection()
+    }
+
+    private func resetFilters() {
+        timeFilter = .all
+        typeFilter = .all
+        sourceFilter = nil
+        resetSelection()
+    }
+
+    private func requestCleanup(title: String, items: Set<UUID>) {
+        guard !items.isEmpty else { return }
+        cleanup = Cleanup(title: title, items: items)
+    }
+
+    private func results(_ items: [ClipboardItem]) -> some View {
+        Group {
+            if items.isEmpty {
+                emptyState
+            } else {
+                let selection = selectedItem(in: items)?.id
+                let quickKeys = quickKeys(for: items)
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        if viewMode == .list {
+                            LazyVStack(spacing: PanelStyle.segmentInset) {
+                                ForEach(items) { item in
+                                    entry(item, selected: item.id == selection, quickKey: quickKeys[item.id])
+                                }
+                            }
+                            .padding(.vertical, PanelStyle.segmentInset)
+                        } else {
+                            LazyVGrid(columns: Self.gridColumns, spacing: PanelStyle.gap) {
+                                ForEach(items) { item in
+                                    entry(item, selected: item.id == selection, quickKey: quickKeys[item.id])
+                                }
+                            }
+                            .padding(PanelStyle.smallGap)
+                        }
+                    }
+                    .onChange(of: selection) { id in
+                        if let id { scroll.scrollTo(id) }
+                    }
+                    .onChange(of: viewMode) { _ in
+                        if let selection { scroll.scrollTo(selection) }
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var emptyText: String {
-        if store.showingFavorites { return "暂无收藏" }
-        if !searchText.isEmpty { return "没有找到匹配内容" }
-        return "剪贴板为空"
+    private func quickKeys(for items: [ClipboardItem]) -> [UUID: Int] {
+        guard window.commandHeld, !batchMode else { return [:] }
+        return Dictionary(items.prefix(9).enumerated().map { ($0.element.id, $0.offset + 1) },
+                          uniquingKeysWith: { first, _ in first })
     }
 
-    // MARK: - 底栏
-
-    private var footer: some View {
-        HStack(spacing: 0) {
-            Text("OctoClip")
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .foregroundColor(DS.textTertiary.opacity(0.6))
-
-            Text(" · ")
-                .foregroundColor(DS.textTertiary.opacity(0.3))
-
-            Text("\(filteredItems.count) 条")
-                .foregroundColor(DS.textTertiary)
-            Spacer()
-            HStack(spacing: 8) {
-                shortcutHint("⇧⇧", "唤出")
-                shortcutHint("ESC", "关闭")
-            }
-        }
-        .font(.system(size: 10))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(DS.surface.opacity(0.5))
-    }
-
-    private func shortcutHint(_ key: String, _ desc: String) -> some View {
-        HStack(spacing: 3) {
-            Text(key)
-                .font(.system(size: 10, weight: .medium, design: .rounded))
-                .padding(.horizontal, 4)
-                .padding(.vertical, 1)
-                .background(DS.divider)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-            Text(desc)
-        }
-        .foregroundColor(DS.textTertiary)
-    }
-}
-
-// MARK: - 列表行
-
-struct ItemRow: View {
-    let item: ClipboardItem
-    let isHovered: Bool
-    let isFavorite: Bool
-
-    var body: some View {
-        HStack(spacing: 10) {
-            iconView
-                .frame(width: 34, height: 34)
-
-            VStack(alignment: .leading, spacing: 3) {
-                if item.hasRichText {
-                    RichTextPreviewView(item: item, maxHeight: 32)
-                        .frame(height: 32)
-                } else {
-                    Text(item.preview)
-                        .font(.system(size: 12.5))
-                        .foregroundColor(DS.textPrimary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                }
-
-                HStack(spacing: 6) {
-                    Text(formatTime(item.timestamp))
-                        .font(.system(size: 10.5))
-                        .foregroundColor(DS.textTertiary)
-                    if isFavorite {
-                        Image(systemName: "star.fill")
-                            .font(.system(size: 8))
-                            .foregroundColor(DS.favorite)
+    private func entry(_ item: ClipboardItem, selected: Bool, quickKey: Int?) -> some View {
+        let favorite = store.isFavorite(item)
+        let hovered = hoveredItemID == item.id
+        let shape = RoundedRectangle(cornerRadius: PanelStyle.itemCorner)
+        let summary = item.type == .text && item.name == nil && viewMode == .list
+            ? item.displayTitle.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            : item.displayTitle
+        let checked = batchIDs.contains(item.id)
+        let highlighted = selected || (batchMode && checked)
+        let fill = entryColor(highlighted: highlighted, hovered: hovered)
+        return HStack(spacing: 0) {
+            Button { activate(item) } label: {
+                HStack(spacing: 0) {
+                    if batchMode {
+                        LucideGlyph(checked ? .circleCheck : .circle)
+                            .foregroundStyle(checked ? PanelStyle.selection : PanelStyle.muted)
+                            .padding(.leading, PanelStyle.itemInset)
+                            .accessibilityHidden(true)
                     }
-                    if item.hasRichText {
-                        Text("富文本")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(DS.accent)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(DS.accent.opacity(0.1))
-                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    if viewMode == .list {
+                        ClipboardRow(item: item, title: summary, favorite: favorite)
+                    } else {
+                        ClipboardCard(item: item, favorite: favorite)
                     }
                 }
             }
+            .buttonStyle(.plain)
+            .focused($keyboardFocus, equals: .result(item.id))
+            .accessibilityLabel(item.source.map { "\(summary)，来源 \($0.name)" } ?? summary)
+            .accessibilityValue(batchMode ? (checked ? "已选中" : "未选中") : (favorite ? "已收藏" : ""))
+            .accessibilityAddTraits((batchMode ? checked : selected) ? .isSelected : [])
+            .accessibilityHint(batchMode ? "切换条目选择" : "粘贴到原应用")
 
-            Spacer(minLength: 0)
+            if viewMode == .list && hovered && !batchMode && quickKey == nil {
+                rowActions(item, favorite: favorite)
+            }
+        }
+        .clipShape(shape)
+        .background {
+            if viewMode == .grid {
+                shape.fill(fill)
+                    .shadow(color: PanelStyle.cardShadow, radius: PanelStyle.cardShadowRadius,
+                            y: PanelStyle.cardShadowOffset)
+            } else {
+                shape.fill(fill)
+            }
+        }
+        .overlay {
+            if keyboardFocus == .result(item.id) || (contrast == .increased && highlighted) {
+                shape.strokeBorder(PanelStyle.selection, lineWidth: PanelStyle.selectionWidth)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if let quickKey {
+                Text("⌘\(quickKey)")
+                    .font(PanelStyle.badgeFont)
+                    .padding(PanelStyle.smallGap)
+                    .background(PanelStyle.control, in: Capsule())
+                    .padding(PanelStyle.smallGap)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .onHover { entered in
+            if entered { hoveredItemID = item.id }
+            else if hoveredItemID == item.id { hoveredItemID = nil }
+        }
+        .contextMenu { itemContextMenu(for: item) }
+        .id(item.id)
+    }
 
-            if isHovered {
-                HStack(spacing: 3) {
-                    ActionBtn(icon: isFavorite ? "star.slash" : "star", color: DS.favorite) {
-                        ClipboardStore.shared.toggleFavorite(item)
+    private func entryColor(highlighted: Bool, hovered: Bool) -> Color {
+        if highlighted { return PanelStyle.selectedItem }
+        if hovered { return PanelStyle.hover }
+        return viewMode == .grid ? PanelStyle.card : .clear
+    }
+
+    private func rowActions(_ item: ClipboardItem, favorite: Bool) -> some View {
+        HStack(spacing: PanelStyle.smallGap) {
+            rowAction(favoriteActionTitle(favorite), symbol: favorite ? .starOff : .star) {
+                store.toggleFavorite(item)
+            }
+            if item.type == .text {
+                rowAction("纯文本粘贴", symbol: .type) { paste(item, mode: .plainText) }
+            }
+            rowAction("快速查看", symbol: .eye) { preview(item) }
+        }
+        .padding(.trailing, PanelStyle.smallGap)
+    }
+
+    private func favoriteActionTitle(_ favorite: Bool) -> String {
+        if favorite { return "取消收藏" }
+        return store.showingFavorites ? "存为本机收藏" : "收藏"
+    }
+
+    private func rowAction(_ label: String, symbol: LucideIcon, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            LucideGlyph(symbol, size: PanelStyle.controlIconSize)
+                .foregroundStyle(PanelStyle.muted)
+                .frame(width: PanelStyle.segmentHeight, height: PanelStyle.segmentHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .help(label)
+    }
+
+    @ViewBuilder
+    private func itemContextMenu(for item: ClipboardItem) -> some View {
+        Button("快速查看") { preview(item) }
+        if item.template == true {
+            Button("填写模板…") { activate(item) }
+                .disabled(batchMode)
+        }
+        Button("原样粘贴") { paste(item) }
+        if item.type == .text {
+            Menu("转换后粘贴") {
+                Button("纯文本") { paste(item, mode: .plainText) }
+                Button("去换行") { paste(item, mode: .noNewlines) }
+                Button("去首尾空白") { paste(item, mode: .trimmed) }
+                Button("Markdown") { paste(item, mode: .markdown) }
+            }
+        } else if item.supportsTextRecognition {
+            Button("复制图中文字") { copyImageText(item) }
+        }
+        Divider()
+        Button(batchIDs.contains(item.id) ? "取消选择" : "加入多选") { toggleBatchItem(item) }
+        let favorite = store.isFavorite(item)
+        let received = store.showingFavorites && !favorite
+        Button(favoriteActionTitle(favorite)) { store.toggleFavorite(item) }
+        if !received {
+            Button(store.showingFavorites ? "编辑收藏…" : "编辑条目…") {
+                editor = .metadata(item, favorite: store.showingFavorites)
+            }
+        }
+        if store.showingFavorites && favorite && sync.folder != nil && sync.canPublish(item) {
+            Button(sync.selectedIDs.contains(item.id) ? "停止同步此收藏" : "同步此收藏") {
+                sync.toggle(item)
+            }
+        }
+        if !store.showingFavorites {
+            Divider()
+            Button("从历史删除", role: .destructive) { store.deleteHistoryItem(item) }
+        }
+    }
+
+    private var emptyState: some View {
+        let isFiltered = !sourceItems.isEmpty
+        return VStack(spacing: PanelStyle.gap) {
+            LucideGlyph(isFiltered ? .listFilter : (store.showingFavorites ? .star : .clipboard),
+                        size: PanelStyle.emptyIconSize)
+                .accessibilityHidden(true)
+            if isSearchingImages {
+                ProgressView("正在识别图片…").controlSize(.small)
+            } else {
+                Text(emptyMessage(filtered: isFiltered)).font(PanelStyle.bodyFont)
+            }
+            if isFiltered && !isSearchingImages {
+                Button("清除筛选") {
+                    searchText = ""
+                    resetFilters()
+                    focusSearch()
+                }
+            } else if store.showingFavorites && !store.items.isEmpty {
+                Button("查看历史") { store.showingFavorites = false }
+            }
+        }
+        .foregroundStyle(PanelStyle.muted)
+        .padding(PanelStyle.panelInset)
+    }
+
+    private func emptyMessage(filtered: Bool) -> String {
+        if filtered { return "当前筛选无结果" }
+        if store.recoveryFile != nil { return "暂无可读取的记录" }
+        return store.showingFavorites ? "暂无收藏" : "复制内容后会显示在这里"
+    }
+
+    @ViewBuilder
+    private var notices: some View {
+        if store.saveFailed || store.recoveryFile != nil || pasteService.feedback != nil ||
+            store.undoTitle != nil || fileOperationInProgress || pasteQueue.manualPayload != nil ||
+            (store.showingFavorites && sync.message != nil) {
+            VStack(spacing: PanelStyle.smallGap) {
+                if store.saveFailed {
+                    notice("剪贴板记录保存失败。", symbol: .circleExclamation) {
+                        Button("重试保存", action: store.retryPersistence)
                     }
-                    ActionBtn(icon: "doc.on.doc", color: DS.accent) {
-                        PasteService.shared.pasteToFrontApp(item, mode: .original)
+                }
+                if let recovery = store.recoveryFile {
+                    notice("部分记录无法读取，原文件已保留。", symbol: .circleExclamation) {
+                        if store.canRetryReading { Button("重试读取", action: store.retryPersistence) }
+                        Button("查看原文件") { NSWorkspace.shared.activateFileViewerSelecting([recovery]) }
                     }
-                    if item.type == .text {
-                        ActionBtn(icon: "textformat", color: DS.accent) {
-                            PasteService.shared.pasteToFrontApp(item, mode: .plainText)
+                }
+                if let feedback = pasteService.feedback {
+                    notice(feedback.message, symbol: feedback.canCopy ? .circleExclamation : .info) {
+                        if feedback.canCopy { Button("复制到剪贴板", action: pasteService.copyFallback) }
+                    }
+                }
+                if pasteQueue.manualPayload != nil {
+                    notice("已复制当前条目。切回目标应用按 ⌘V。", symbol: .clipboard) {
+                        Button("重新复制", action: pasteQueue.recopy)
+                    }
+                }
+                if fileOperationInProgress {
+                    notice("正在处理文件…", symbol: .file) { ProgressView().controlSize(.small) }
+                }
+                if store.showingFavorites, let message = sync.message {
+                    notice(message, symbol: .refresh) {
+                        if sync.folder != nil {
+                            Button("重试", action: sync.refresh)
                         }
                     }
                 }
-                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                if let undo = store.undoTitle {
+                    notice(undo, symbol: .undo) {
+                        Button("撤销", action: store.undoDeletion)
+                    }
+                }
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: DS.cardRadius)
-                .fill(isHovered ? DS.surfaceHover : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.15), value: isHovered)
     }
 
-    @ViewBuilder
-    private var iconView: some View {
-        switch item.type {
-        case .text:
-            RoundedRectangle(cornerRadius: 7)
-                .fill(DS.textBg)
-                .overlay(
-                    Image(systemName: "doc.text")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(DS.textColor)
-                )
-        case .image:
-            if let data = item.imageData {
-                if item.imageFormat == .gif {
-                    AnimatedImageView(data: data)
-                        .frame(width: 34, height: 34)
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-                } else if let img = NSImage(data: data) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 34, height: 34)
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+    private func notice<Actions: View>(_ message: String, symbol: LucideIcon, @ViewBuilder actions: () -> Actions) -> some View {
+        HStack(spacing: PanelStyle.gap) {
+            Label {
+                Text(message)
+            } icon: {
+                LucideGlyph(symbol, size: PanelStyle.controlIconSize)
+                    .accessibilityHidden(true)
+            }
+            .foregroundStyle(PanelStyle.text)
+            Spacer(minLength: 0)
+            actions()
+        }
+        .font(PanelStyle.controlFont)
+        .controlSize(.small)
+        .padding(.horizontal, PanelStyle.itemInset)
+        .padding(.vertical, PanelStyle.smallGap)
+        .background(PanelStyle.tray, in: RoundedRectangle(cornerRadius: PanelStyle.itemCorner))
+    }
+
+    private func footer(filtered items: [ClipboardItem]) -> some View {
+        let count = items.count
+        return HStack(spacing: PanelStyle.gap) {
+            if batchMode {
+                batchActions(filtered: items)
+            } else {
+                Text("\(count) 条").monospacedDigit()
+                Spacer()
+                if !pasteQueue.items.isEmpty {
+                    if pasteQueue.manualPayload != nil {
+                        Button("已粘贴，继续", action: pasteQueue.confirmManualPaste)
+                    } else {
+                        Button("粘贴下一条（\(pasteQueue.items.count)）", action: pasteNextInQueue)
+                    }
+                    Button("清空队列", action: pasteQueue.clear)
+                } else if count > 0 {
+                    if isSearchingImages { ProgressView().controlSize(.small).accessibilityLabel("正在识别图片") }
+                    shortcut("⌘Y", "预览")
+                    shortcut("↵", "粘贴")
+                }
+            }
+        }
+        .font(PanelStyle.metadataFont)
+        .foregroundStyle(PanelStyle.muted)
+        .padding(.horizontal, PanelStyle.smallGap)
+    }
+
+    private func batchActions(filtered items: [ClipboardItem]) -> some View {
+        let clips = selectedClips
+        let visibleIDs = Set(items.map(\.id))
+        let hiddenCount = clips.filter { !visibleIDs.contains($0.id) }.count
+        let ocrPending = clips.contains { $0.supportsTextRecognition && imageText.results[$0.id] == nil }
+        return Group {
+            if reviewingBatch {
+                Text("已选 \(clips.count) 条").monospacedDigit()
+                Button("返回结果", action: closeSelectedReview)
+            } else if hiddenCount > 0 {
+                Text("已选 \(clips.count) 条，含 \(hiddenCount) 条隐藏项").monospacedDigit()
+                Button("查看已选") {
+                    reviewingBatch = true
+                    resetSelection()
+                    focusSearch()
                 }
             } else {
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(DS.imageBg)
-                    .overlay(
-                        Image(systemName: "photo")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(DS.imageColor)
-                    )
+                Text("已选 \(clips.count) 条").monospacedDigit()
             }
-        case .file:
-            RoundedRectangle(cornerRadius: 7)
-                .fill(DS.fileBg)
-                .overlay(
-                    Image(systemName: "folder")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(DS.fileColor)
-                )
-        }
-    }
-
-    private func formatTime(_ date: Date) -> String {
-        let interval = Date().timeIntervalSince(date)
-        if interval < 60 { return "刚刚" }
-        if interval < 3600 { return "\(Int(interval / 60)) 分钟前" }
-        if interval < 86400 { return "\(Int(interval / 3600)) 小时前" }
-        let f = DateFormatter()
-        f.dateFormat = "MM/dd HH:mm"
-        return f.string(from: date)
-    }
-}
-
-// MARK: - 宫格单元格
-
-struct GridCell: View {
-    let item: ClipboardItem
-    let isHovered: Bool
-    let isFavorite: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // 内容区
-            ZStack(alignment: .topTrailing) {
-                contentPreview
-                if isFavorite {
-                    Image(systemName: "star.fill")
-                        .font(.system(size: 8))
-                        .foregroundColor(DS.favorite)
-                        .padding(5)
+            Spacer()
+            if ocrPending { ProgressView().controlSize(.small).accessibilityLabel("正在识别所选图片") }
+            Menu("批量操作") {
+                Button(clips.contains { !$0.templateFields.isEmpty } ? "填写模板并合并粘贴…" : "合并为文本并粘贴") {
+                    mergeAndPaste(clips)
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
-
-            // 底部信息
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.preview)
-                    .font(.system(size: 10.5))
-                    .foregroundColor(DS.textPrimary)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .frame(height: 26, alignment: .topLeading)
-
-                Text(formatTime(item.timestamp))
-                    .font(.system(size: 9.5))
-                    .foregroundColor(DS.textTertiary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-        }
-        .background(DS.surface)
-        .clipShape(RoundedRectangle(cornerRadius: DS.cardRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.cardRadius)
-                .stroke(isHovered ? DS.accent.opacity(0.4) : DS.divider, lineWidth: isHovered ? 1.5 : 0.5)
-        )
-        .shadow(color: Color.black.opacity(isHovered ? 0.06 : 0.02), radius: isHovered ? 6 : 2, y: isHovered ? 2 : 1)
-        .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.15), value: isHovered)
-    }
-
-    @ViewBuilder
-    private var contentPreview: some View {
-        switch item.type {
-        case .text:
-            if item.hasRichText {
-                RichTextPreviewView(item: item, maxHeight: 80)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                Text(item.plainText?.prefix(100) ?? "")
-                    .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundColor(DS.textSecondary.opacity(0.8))
-                    .lineLimit(nil)
-                    .padding(7)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .background(DS.textBg.opacity(0.5))
-            }
-        case .image:
-            if let data = item.imageData {
-                if item.imageFormat == .gif {
-                    AnimatedImageView(data: data)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let img = NSImage(data: data) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .disabled(clips.count < 2 || clips.contains { $0.type != .text })
+                Button(pasteQueue.items.isEmpty ? "按顺序逐条粘贴" : "替换队列并逐条粘贴") { beginQueue(clips) }
+                Divider()
+                Button("复制 Markdown 资料清单") {
+                    copyText(ClipDocument.markdownList(clips, recognizedText: imageText.results), confirmation: "已复制资料清单。")
                 }
-            } else {
-                DS.imageBg
-                    .overlay(
-                        Image(systemName: "photo")
-                            .font(.system(size: 18, weight: .light))
-                            .foregroundColor(DS.imageColor.opacity(0.6))
-                    )
-            }
-        case .file:
-            DS.fileBg
-                .overlay(
-                    Image(systemName: "folder")
-                        .font(.system(size: 18, weight: .light))
-                        .foregroundColor(DS.fileColor.opacity(0.6))
-                )
-        }
-    }
-
-    private func formatTime(_ date: Date) -> String {
-        let interval = Date().timeIntervalSince(date)
-        if interval < 60 { return "刚刚" }
-        if interval < 3600 { return "\(Int(interval / 60))分钟前" }
-        if interval < 86400 { return "\(Int(interval / 3600))小时前" }
-        let f = DateFormatter()
-        f.dateFormat = "MM/dd HH:mm"
-        return f.string(from: date)
-    }
-}
-
-// MARK: - Action Button
-
-struct ActionBtn: View {
-    let icon: String
-    var color: Color = DS.accent
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(color)
-                .frame(width: 24, height: 24)
-                .background(color.opacity(0.1))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-// MARK: - 富文本预览
-
-/// 条件滚动的 ScrollView：仅当 enabled 为 true 时处理滚轮事件，否则透传给父视图
-class ConditionalScrollView: NSScrollView {
-    var scrollEnabled = false
-    var onMouseEntered: (() -> Void)?
-    var onMouseExited: (() -> Void)?
-
-    override func scrollWheel(with event: NSEvent) {
-        if scrollEnabled {
-            super.scrollWheel(with: event)
-        } else {
-            nextResponder?.scrollWheel(with: event)
-        }
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        onMouseEntered?()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        onMouseExited?()
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        for area in trackingAreas { removeTrackingArea(area) }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-    }
-}
-
-/// 当 item 带有 HTML/RTF 样式时，用 NSTextView 渲染带样式的预览
-/// hover 500ms 后启用滚动并自动向下滚动，离开后复位到顶部
-struct RichTextPreviewView: NSViewRepresentable {
-    let item: ClipboardItem
-    let maxHeight: CGFloat
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = ConditionalScrollView()
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.autohidesScrollers = true
-
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = false
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 4, height: 4)
-        textView.textContainer?.lineFragmentPadding = 2
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.textContainer?.widthTracksTextView = true
-        textView.minSize = NSSize.zero
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-
-        scrollView.documentView = textView
-
-        scrollView.onMouseEntered = { [weak scrollView] in
-            context.coordinator.scheduleScrollEnable(scrollView)
-        }
-        scrollView.onMouseExited = { [weak scrollView] in
-            context.coordinator.disableScrolling(scrollView)
-        }
-
-        context.coordinator.textView = textView
-
-        configureText(textView)
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        if let textView = scrollView.documentView as? NSTextView {
-            configureText(textView)
-        }
-    }
-
-    private func configureText(_ textView: NSTextView) {
-        let attrString: NSAttributedString
-        if let htmlData = item.htmlData,
-           let html = NSAttributedString(html: htmlData, documentAttributes: nil) {
-            attrString = html
-        } else if let rtfData = item.rtfData,
-                  let rtf = NSAttributedString(rtf: rtfData, documentAttributes: nil) {
-            attrString = rtf
-        } else {
-            attrString = NSAttributedString(string: item.plainText ?? "")
-        }
-
-        // 限制展示长度，避免超长内容卡顿
-        let maxLen = 500
-        let displayStr: NSAttributedString
-        if attrString.length > maxLen {
-            displayStr = attrString.attributedSubstring(from: NSRange(location: 0, length: maxLen))
-        } else {
-            displayStr = attrString
-        }
-
-        textView.textStorage?.setAttributedString(displayStr)
-    }
-
-    // MARK: - Coordinator
-
-    class Coordinator: NSObject {
-        weak var textView: NSTextView?
-        private var hoverTimer: Timer?
-        private var autoScrollTimer: Timer?
-
-        func scheduleScrollEnable(_ scrollView: ConditionalScrollView?) {
-            hoverTimer?.invalidate()
-            hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self, weak scrollView] _ in
-                guard let sv = scrollView else { return }
-                self?.enableScrolling(sv)
-            }
-        }
-
-        func disableScrolling(_ scrollView: ConditionalScrollView?) {
-            hoverTimer?.invalidate()
-            hoverTimer = nil
-            autoScrollTimer?.invalidate()
-            autoScrollTimer = nil
-            scrollView?.scrollEnabled = false
-            // 复位到顶部
-            scrollView?.contentView.scroll(to: NSPoint(x: 0, y: 0))
-        }
-
-        private func enableScrolling(_ scrollView: ConditionalScrollView) {
-            scrollView.scrollEnabled = true
-
-            // 自动向下滚动
-            autoScrollTimer?.invalidate()
-            autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak scrollView] _ in
-                guard let sv = scrollView else { return }
-                let currentOffset = sv.contentView.bounds.origin.y
-                let docHeight = sv.documentView?.bounds.height ?? 0
-                let viewHeight = sv.contentView.bounds.height
-                let maxOffset = max(0, docHeight - viewHeight)
-                if currentOffset < maxOffset {
-                    let newOffset = min(currentOffset + 0.5, maxOffset)
-                    sv.contentView.scroll(to: NSPoint(x: 0, y: newOffset))
-                } else {
-                    // reached bottom, stop auto-scroll
+                .disabled(ocrPending)
+                Button("导出 Markdown 资料清单…") {
+                    let markdown = ClipDocument.markdownList(clips, recognizedText: imageText.results)
+                    saveDocument(filename: "剪贴资料.md", type: UTType(filenameExtension: "md") ?? .plainText,
+                                 confirmation: "资料清单已导出。") { Data(markdown.utf8) }
                 }
+                .disabled(ocrPending || fileOperationInProgress)
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(clips.isEmpty)
         }
     }
-}
 
-// MARK: - GIF 动画图片视图
-
-struct AnimatedImageView: NSViewRepresentable {
-    let data: Data
-
-    func makeNSView(context: Context) -> NSImageView {
-        let imageView = NSImageView()
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.animates = true
-        imageView.image = NSImage(data: data)
-        return imageView
-    }
-
-    func updateNSView(_ nsView: NSImageView, context: Context) {
-        nsView.image = NSImage(data: data)
-    }
-}
-
-/// 判断 item 是否有富文本样式
-extension ClipboardItem {
-    var hasRichText: Bool {
-        type == .text && (htmlData != nil || rtfData != nil)
+    private func shortcut(_ key: String, _ action: String) -> some View {
+        HStack(spacing: PanelStyle.smallGap) {
+            Text(key)
+                .font(PanelStyle.badgeFont)
+            Text(action)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
